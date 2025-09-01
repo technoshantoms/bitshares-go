@@ -1,48 +1,41 @@
-# scorum/bitshares-go
-[![Go Report Card](https://goreportcard.com/badge/github.com/scorum/bitshares-go)](https://goreportcard.com/report/github.com/scorum/bitshares-go)
-[![GoDoc](https://godoc.org/github.com/scorum/bitshares-go?status.svg)](https://godoc.org/github.com/scorum/bitshares-go)
-[![Build Status](https://travis-ci.org/scorum/bitshares-go.svg?branch=master)](https://travis-ci.org/scorum/bitshares-go)
+# scorum/scorum-go
+[![Go Report Card](https://goreportcard.com/badge/github.com/scorum/scorum-go)](https://goreportcard.com/report/github.com/scorum/scorum-go)
+[![GoDoc](https://godoc.org/github.com/scorum/scorum-go?status.svg)](https://godoc.org/github.com/scorum/scorum-go)
+[![Build Status](https://travis-ci.org/scorum/scorum-go.svg?branch=master)](https://travis-ci.org/scorum/scorum-go)
 
-
-Golang RPC (via websockets) client library for [Bitshares](https://bitshares.org/) and [OpenLedger](https://openledger.io) in particular
+Golang RPC client library for [Scorum](https://scorumcoins.com). Both http and websocket transports are supported.
+The websocket one allows to set callbacks.
 
 ## Usage
 
 ```go
-import "github.com/scorum/bitshares-go"
+import "github.com/scorum/scorum-go"
 ```
 
 ## Example
 ```go
-client, err := NewClient("wss://bitshares.openledger.info/ws")
+import (
+    scorum "github.com/scorum/scorum-go"
+    "github.com/scorum/scorum-go/rpc"
+)
 
-// retrieve the current global_property_object
-props, err := client.Database.GetDynamicGlobalProperties()
+const testNet = "https://testnet.scorum.com"
 
-// lookup symbols ids
-symbols, err := client.Database.LookupAssetSymbols("OPEN.SCR", "USD")
-require.NoError(t, err)
+// create client
+transport := rpc.NewHTTPTransport(testNet)
+client := NewClient(transport)
 
-openSCR := symbols[0].ID
-USD := symbols[1].ID
+// get last 100 transactions of the particular account
+history, _ := client.AccountHistory.GetAccountHistory("acc1", -1, 100)
 
-// retrieve 5 last filled orders
-orders, err := client.History.GetFillOrderHistory(openSCR, USD, 5)
-
-// set a block applied callback
-client.Database.SetBlockAppliedCallback(func(blockID string, err error) {
-    log.Println(blockID)
-})
-
-// cancel all callbacks
-client.Database.CancelAllSubscriptions()
+for seq, trx := range history {
+    for _, op := range trx.Operations {
+        switch body := op.(type) {
+        case *types.TransferOperation:
+            // do something with the incoming transaction
+        }
+    }
+}
 
 ```
-## Status
-The project is in active development but should not be used in production yet.
-
-## Supported operations
- - Transfer
- - LimitOrderCreate
- - LimitOrderCancel
 

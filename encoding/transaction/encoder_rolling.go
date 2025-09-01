@@ -1,5 +1,7 @@
 package transaction
 
+import "github.com/google/uuid"
+
 type RollingEncoder struct {
 	next *Encoder
 	err  error
@@ -45,15 +47,9 @@ func (encoder *RollingEncoder) EncodeMoney(s string) {
 	}
 }
 
-func (encoder *RollingEncoder) EncodeLittleEndianUInt64(i uint64) {
+func (encoder *RollingEncoder) EncodeUUID(id uuid.UUID) {
 	if encoder.err == nil {
-		encoder.err = encoder.next.EncodeLittleEndianUInt64(i)
-	}
-}
-
-func (encoder *RollingEncoder) EncodeLittleEndianUInt32(i uint32) {
-	if encoder.err == nil {
-		encoder.err = encoder.next.EncodeLittleEndianUInt32(i)
+		encoder.err = encoder.next.EncodeUUID(id)
 	}
 }
 

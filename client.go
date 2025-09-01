@@ -1,82 +1,85 @@
-package bitshares
+package scorumgo
 
 import (
-	"encoding/json"
-
-	"github.com/pkg/errors"
-	"github.com/scorum/bitshares-go/apis/database"
-	"github.com/scorum/bitshares-go/apis/history"
-	"github.com/scorum/bitshares-go/apis/login"
-	"github.com/scorum/bitshares-go/apis/networkbroadcast"
-	"github.com/scorum/bitshares-go/caller"
-	"github.com/scorum/bitshares-go/sign"
-	"github.com/scorum/bitshares-go/transport/websocket"
-	"github.com/scorum/bitshares-go/types"
-	"log"
+	"context"
+	"encoding/hex"
+	"fmt"
 	"time"
+
+	"github.com/scorum/scorum-go/apis/account_history"
+	"github.com/scorum/scorum-go/apis/betting"
+	"github.com/scorum/scorum-go/apis/blockchain_history"
+	"github.com/scorum/scorum-go/apis/chain"
+	"github.com/scorum/scorum-go/apis/database"
+	"github.com/scorum/scorum-go/apis/network_broadcast"
+	"github.com/scorum/scorum-go/caller"
+	"github.com/scorum/scorum-go/key"
+	"github.com/scorum/scorum-go/sign"
+	"github.com/scorum/scorum-go/types"
 )
 
+// Client can be used to access Scorum remote APIs.
+//
+// There is a public field for every Scorum API available,
+// e.g. Client.Database corresponds to database_api.
 type Client struct {
 	cc caller.CallCloser
 
 	// Database represents database_api
 	Database *database.API
 
+	// AccountHistory represents account_history_api
+	AccountHistory *account_history.API
+
 	// NetworkBroadcast represents network_broadcast_api
-	NetworkBroadcast *networkbroadcast.API
+	NetworkBroadcast *network_broadcast.API
 
-	// History represents history_api
-	History *history.API
+	// BlockchainHistory represents blockchain_history_api
+	BlockchainHistory *blockchain_history.API
 
-	// Login represents login_api
-	Login *login.API
+	// Betting represents betting_api
+	Betting *betting.API
 
-	chainID string
+	// Chain represents chain_api
+	Chain *chain.API
+
+	getReferenceBlock getReferenceBlock
 }
 
-// NewClient creates a new RPC client
-func NewClient(url string) (*Client, error) {
-	// transport
-	transport, err := websocket.NewTransport(url)
-	if err != nil {
-		return nil, err
+type reference struct {
+	time   types.Time
+	number uint16
+	prefix uint32
+}
+
+type getReferenceBlock func(ctx context.Context) (reference, error)
+
+type Option func(c *Client)
+
+func WithHeadBlockReferenceSign() Option {
+	return func(c *Client) {
+		c.getReferenceBlock = c.getHeadBlockReference
+	}
+}
+
+// NewClient creates a new RPC client that use the given CallCloser internally.
+func NewClient(cc caller.CallCloser, opts ...Option) *Client {
+	client := &Client{
+		cc: cc,
+	}
+	client.Database = database.NewAPI(client.cc)
+	client.Chain = chain.NewAPI(client.cc)
+	client.AccountHistory = account_history.NewAPI(client.cc)
+	client.NetworkBroadcast = network_broadcast.NewAPI(client.cc)
+	client.BlockchainHistory = blockchain_history.NewAPI(client.cc)
+	client.Betting = betting.NewAPI(client.cc)
+	client.getReferenceBlock = client.getLastIrreversibleBlockReference
+
+	for _, opt := range opts {
+		opt(client)
 	}
 
-	client := &Client{cc: transport}
-
-	// login
-	loginAPI := login.NewAPI(transport)
-	client.Login = loginAPI
-
-	// database
-	databaseAPIID, err := loginAPI.Database()
-	if err != nil {
-		return nil, err
-	}
-	client.Database = database.NewAPI(databaseAPIID, client.cc)
-
-	// chain ID
-	chainID, err := client.Database.GetChainID()
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get chain ID")
-	}
-	client.chainID = *chainID
-
-	// history
-	historyAPIID, err := loginAPI.History()
-	if err != nil {
-		return nil, err
-	}
-	client.History = history.NewAPI(historyAPIID, client.cc)
-
-	// network broadcast
-	networkBroadcastAPIID, err := loginAPI.NetworkBroadcast()
-	if err != nil {
-		return nil, err
-	}
-	client.NetworkBroadcast = networkbroadcast.NewAPI(networkBroadcastAPIID, client.cc)
-
-	return client, nil
+	return client
 }
 
 // Close should be used to close the client when no longer needed.
@@ -85,133 +88,83 @@ func (client *Client) Close() error {
 	return client.cc.Close()
 }
 
-// Transfer a certain amount of the given asset
-func (client *Client) Transfer(key string, from, to types.ObjectID, amount, fee types.AssetAmount) error {
-	op := types.NewTransferOperation(from, to, amount, fee)
-
-	fees, err := client.Database.GetRequiredFee([]types.Operation{op}, fee.AssetID.String())
+func (client *Client) BroadcastTransactionSynchronous(ctx context.Context, chainID []byte, operations []types.Operation, keys ...*key.PrivateKey) (*network_broadcast.BroadcastResponse, error) {
+	stx, err := client.createSignedTransaction(ctx, chainID, operations, keys...)
 	if err != nil {
-		log.Println(err)
-		return errors.Wrap(err, "can't get fees")
+		return nil, err
 	}
-	op.Fee.Amount = fees[0].Amount
-
-	stx, err := client.sign([]string{key}, op)
-	if err != nil {
-		return err
-	}
-	return client.broadcast(stx)
+	return client.NetworkBroadcast.BroadcastTransactionSynchronous(ctx, stx.Transaction)
 }
 
-func (client *Client) LimitOrderCreate(key string, seller types.ObjectID, fee, amToSell, minToRecive types.AssetAmount, expiration time.Duration, fillOrKill bool) (string, error) {
-	props, err := client.Database.GetDynamicGlobalProperties()
-	if err != nil {
-		return "", errors.Wrap(err, "failed to get dynamic global properties")
-	}
-
-	op := &types.LimitOrderCreateOperation{
-		Fee:          fee,
-		Seller:       seller,
-		AmountToSell: amToSell,
-		MinToReceive: minToRecive,
-		Expiration:   types.NewTime(props.Time.Add(expiration)),
-		FillOrKill:   fillOrKill,
-		Extensions:   []json.RawMessage{},
-	}
-
-	fees, err := client.Database.GetRequiredFee([]types.Operation{op}, fee.AssetID.String())
-	if err != nil {
-		log.Println(err)
-		return "", errors.Wrap(err, "can't get fees")
-	}
-	op.Fee.Amount = fees[0].Amount
-
-	stx, err := client.sign([]string{key}, op)
-	if err != nil {
-		return "", err
-	}
-	result, err := client.broadcastSync(stx)
+func (client *Client) BroadcastTransaction(ctx context.Context, chainID []byte, operations []types.Operation, keys ...*key.PrivateKey) (string, error) {
+	stx, err := client.createSignedTransaction(ctx, chainID, operations, keys...)
 	if err != nil {
 		return "", err
 	}
 
-	res := result.Trx["operation_results"]
-	ops, ok := res.([]interface{})
-	if !ok {
-		return "", errors.New("invalid result format")
-	}
-	create_op, ok := ops[0].([]interface{})
-	if !ok {
-		return "", errors.New("invalid result format")
-	}
-	id, ok := create_op[1].(string)
-	if !ok {
-		return "", errors.New("invalid result format")
-	}
+	id, _ := stx.ID()
 
-	return id, err
+	return hex.EncodeToString(id), client.NetworkBroadcast.BroadcastTransaction(ctx, stx.Transaction)
 }
 
-func (client *Client) LimitOrderCancel(key string, feePayingAccount, order types.ObjectID, fee types.AssetAmount) error {
-	op := &types.LimitOrderCancelOperation{
-		Fee:              fee,
-		FeePayingAccount: feePayingAccount,
-		Order:            order,
-		Extensions:       []json.RawMessage{},
-	}
-
-	fees, err := client.Database.GetRequiredFee([]types.Operation{op}, fee.AssetID.String())
+func (client *Client) createSignedTransaction(ctx context.Context, chainID []byte, operations []types.Operation, keys ...*key.PrivateKey) (*sign.SignedTransaction, error) {
+	refBlock, err := client.getReferenceBlock(ctx)
 	if err != nil {
-		log.Println(err)
-		return errors.Wrap(err, "can't get fees")
-	}
-	op.Fee.Amount = fees[0].Amount
-
-	stx, err := client.sign([]string{key}, op)
-	if err != nil {
-		return err
-	}
-	return client.broadcast(stx)
-}
-
-func (client *Client) sign(wifs []string, operations ...types.Operation) (*sign.SignedTransaction, error) {
-	props, err := client.Database.GetDynamicGlobalProperties()
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get dynamic global properties")
+		return nil, err
 	}
 
-	block, err := client.Database.GetBlock(props.LastIrreversibleBlockNum)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get block")
-	}
-
-	refBlockPrefix, err := sign.RefBlockPrefix(block.Previous)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to sign block prefix")
-	}
-
-	expiration := props.Time.Add(10 * time.Minute)
+	expiration := refBlock.time.Add(10 * time.Minute)
 	stx := sign.NewSignedTransaction(&types.Transaction{
-		RefBlockNum:    sign.RefBlockNum(props.LastIrreversibleBlockNum - 1&0xffff),
-		RefBlockPrefix: refBlockPrefix,
-		Expiration:     types.Time{Time: &expiration},
+		Operations:     operations,
+		RefBlockNum:    refBlock.number,
+		RefBlockPrefix: refBlock.prefix,
+		Expiration:     &types.Time{Time: &expiration},
 	})
 
-	for _, op := range operations {
-		stx.PushOperation(op)
-	}
-
-	if err = stx.Sign(wifs, client.chainID); err != nil {
-		return nil, errors.Wrap(err, "failed to sign the transaction")
+	if err = stx.Sign(chainID, keys...); err != nil {
+		return nil, fmt.Errorf("sign transaction: %w", err)
 	}
 
 	return stx, nil
 }
 
-func (client *Client) broadcast(stx *sign.SignedTransaction) error {
-	return client.NetworkBroadcast.BroadcastTransaction(stx.Transaction)
+func (client *Client) getLastIrreversibleBlockReference(ctx context.Context) (reference, error) {
+	props, err := client.Chain.GetChainProperties(ctx)
+	if err != nil {
+		return reference{}, fmt.Errorf("get chainID properties: %w", err)
+	}
+
+	block, err := client.BlockchainHistory.GetBlock(ctx, props.LastIrreversibleBlockNumber)
+	if err != nil {
+		return reference{}, fmt.Errorf("blockchain history get block: %w", err)
+	}
+
+	number, prefix, err := sign.ParseBlockID(block.Previous)
+	if err != nil {
+		return reference{}, fmt.Errorf("ref block prefix: %w", err)
+	}
+
+	return reference{
+		time:   props.Time,
+		number: number,
+		prefix: prefix,
+	}, nil
 }
 
-func (client *Client) broadcastSync(stx *sign.SignedTransaction) (*networkbroadcast.BroadcastResponse, error) {
-	return client.NetworkBroadcast.BroadcastTransactionSynchronous(stx.Transaction)
+func (client *Client) getHeadBlockReference(ctx context.Context) (reference, error) {
+	props, err := client.Chain.GetChainProperties(ctx)
+	if err != nil {
+		return reference{}, fmt.Errorf("get chainID properties: %w", err)
+	}
+
+	number, prefix, err := sign.ParseBlockID(props.HeadBlockID)
+	if err != nil {
+		return reference{}, fmt.Errorf("ref block prefix: %w", err)
+	}
+
+	return reference{
+		time:   props.Time,
+		number: number,
+		prefix: prefix,
+	}, nil
 }

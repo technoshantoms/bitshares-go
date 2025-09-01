@@ -1,20 +1,15 @@
 package types
 
 import (
-	"github.com/scorum/bitshares-go/encoding/transaction"
 	"time"
+
+	"github.com/scorum/scorum-go/encoding/transaction"
 )
 
 const Layout = `"2006-01-02T15:04:05"`
 
 type Time struct {
 	*time.Time
-}
-
-func NewTime(t time.Time) Time {
-	return Time{
-		&t,
-	}
 }
 
 func (t *Time) MarshalJSON() ([]byte, error) {
@@ -30,6 +25,6 @@ func (t *Time) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (t Time) MarshalTransaction(encoder *transaction.Encoder) error {
-	return encoder.EncodeLittleEndianUInt32(uint32(t.Time.UTC().Unix()))
+func (t *Time) MarshalTransaction(encoder *transaction.Encoder) error {
+	return encoder.Encode(uint32(t.Time.UTC().Unix()))
 }
